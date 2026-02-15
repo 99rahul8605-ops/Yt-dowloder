@@ -19,6 +19,7 @@ import asyncio
 import logging
 import tempfile
 import signal
+import shutil  # <-- ADDED for cross‑filesystem move
 from pathlib import Path
 
 import yt_dlp
@@ -261,7 +262,7 @@ async def download_and_upload(url: str, update: Update, context: ContextTypes.DE
                         await status_msg.edit_text(f"❌ Download failed after retries: {str(e)[:200]}")
                         return
 
-# ---------- Update cookies command ----------
+# ---------- Update cookies command (FIXED with shutil.move) ----------
 async def update_cookies(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Allow admin to upload a new cookies.txt file."""
     user = update.effective_user
@@ -278,23 +279,29 @@ async def update_cookies(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ File too large (max 1 MB).")
         return
 
+    # Let the user know we're processing
+    await update.message.reply_text("⏳ Downloading and validating cookies file...")
+
     file = await context.bot.get_file(doc.file_id)
     try:
         with tempfile.NamedTemporaryFile(mode='wb', suffix='.txt', delete=False) as tmp:
             await file.download_to_drive(tmp.name)
             tmp_path = tmp.name
 
+        # Validate content
         with open(tmp_path, 'r', encoding='utf-8') as f:
             first_line = f.readline().strip()
             if not first_line.startswith("# Netscape HTTP Cookie File"):
                 raise ValueError("Invalid cookies file format (first line must be '# Netscape HTTP Cookie File')")
 
+        # Replace the old cookies file using shutil.move (works across filesystems)
         dest = Path(COOKIES_FILE)
         dest.unlink(missing_ok=True)
-        Path(tmp_path).rename(dest)
+        shutil.move(tmp_path, dest)
 
         await update.message.reply_text("✅ Cookies file updated successfully.")
         logger.info(f"Cookies file updated by user {user.id}")
+
     except Exception as e:
         logger.exception("Cookie update failed")
         await update.message.reply_text(f"❌ Failed to update cookies: {str(e)[:200]}")
@@ -346,7 +353,7 @@ async def run_http_server():
     await site.start()
     logger.info(f"HTTP health check server running on port {PORT}")
 
-# ---------- Main entry point (fixed event loop) ----------
+# ---------- Main entry point ----------
 async def main():
     if not Path(COOKIES_FILE).exists():
         logger.warning(f"Cookies file '{COOKIES_FILE}' not found. Authentication may fail.")
