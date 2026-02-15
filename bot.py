@@ -9,7 +9,7 @@ Telegram YouTube Downloader Bot
 - Retries once on failure.
 - Auto‑deletes temporary files.
 - Fully async and memory‑safe.
-- Admin command /updatecookies to upload a new cookies.txt file.
+- Admin commands: /updatecookies, /checkcookies.
 - Optional HTTP health check server for Render (listens on $PORT).
 """
 
@@ -19,7 +19,7 @@ import asyncio
 import logging
 import tempfile
 import signal
-import shutil  # <-- ADDED for cross‑filesystem move
+import shutil
 from pathlib import Path
 
 import yt_dlp
@@ -52,6 +52,21 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# ---------- Startup checks ----------
+cookies_path = Path(COOKIES_FILE).absolute()
+logger.info(f"Cookies file path: {cookies_path}")
+if cookies_path.exists():
+    logger.info(f"Cookies file exists, size: {cookies_path.stat().st_size} bytes")
+else:
+    logger.warning("Cookies file not found. Authentication may fail.")
+
+# Check if the directory is writable
+parent_dir = cookies_path.parent
+if os.access(parent_dir, os.W_OK):
+    logger.info(f"Directory {parent_dir} is writable.")
+else:
+    logger.error(f"Directory {parent_dir} is NOT writable! Cookie updates will fail.")
 
 # ---------- Helper functions ----------
 def extract_url(text: str) -> str | None:
@@ -262,7 +277,38 @@ async def download_and_upload(url: str, update: Update, context: ContextTypes.DE
                         await status_msg.edit_text(f"❌ Download failed after retries: {str(e)[:200]}")
                         return
 
-# ---------- Update cookies command (FIXED with shutil.move) ----------
+# ---------- Admin command: Check cookies ----------
+async def check_cookies(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to check the status of the cookies file."""
+    user = update.effective_user
+    if not user or (ADMIN_IDS and user.id not in ADMIN_IDS):
+        await update.message.reply_text("❌ You are not authorized to use this command.")
+        return
+
+    path = Path(COOKIES_FILE).absolute()
+    if not path.exists():
+        await update.message.reply_text(f"❌ Cookies file not found at: {path}")
+        return
+
+    size = path.stat().st_size
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            first_line = f.readline().strip()
+            second_line = f.readline().strip()[:100]  # first few chars of second line
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error reading cookies file: {e}")
+        return
+
+    msg = (
+        f"✅ Cookies file exists:\n"
+        f"📁 Path: `{path}`\n"
+        f"📦 Size: {size} bytes\n"
+        f"🔑 First line: `{first_line}`\n"
+        f"📄 Preview: `{second_line}...`"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+# ---------- Admin command: Update cookies (improved) ----------
 async def update_cookies(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Allow admin to upload a new cookies.txt file."""
     user = update.effective_user
@@ -279,12 +325,16 @@ async def update_cookies(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ File too large (max 1 MB).")
         return
 
-    # Let the user know we're processing
-    await update.message.reply_text("⏳ Downloading and validating cookies file...")
+    status_msg = await update.message.reply_text("⏳ Downloading and validating cookies file...")
 
     file = await context.bot.get_file(doc.file_id)
+    tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(mode='wb', suffix='.txt', delete=False) as tmp:
+        # Use a temporary file in the SAME directory as the target to avoid cross-filesystem issues
+        dest_dir = Path(COOKIES_FILE).parent
+        dest_dir.mkdir(parents=True, exist_ok=True)  # ensure directory exists
+
+        with tempfile.NamedTemporaryFile(mode='wb', suffix='.txt', dir=dest_dir, delete=False) as tmp:
             await file.download_to_drive(tmp.name)
             tmp_path = tmp.name
 
@@ -294,19 +344,24 @@ async def update_cookies(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not first_line.startswith("# Netscape HTTP Cookie File"):
                 raise ValueError("Invalid cookies file format (first line must be '# Netscape HTTP Cookie File')")
 
-        # Replace the old cookies file using shutil.move (works across filesystems)
-        dest = Path(COOKIES_FILE)
+        # Replace the old file (atomic on same filesystem)
+        dest = Path(COOKIES_FILE).absolute()
         dest.unlink(missing_ok=True)
         shutil.move(tmp_path, dest)
+        tmp_path = None  # prevent deletion in finally
 
-        await update.message.reply_text("✅ Cookies file updated successfully.")
+        await status_msg.edit_text(
+            f"✅ Cookies file updated successfully.\n"
+            f"📁 Path: `{dest}`\n"
+            f"📦 Size: {dest.stat().st_size} bytes"
+        )
         logger.info(f"Cookies file updated by user {user.id}")
 
     except Exception as e:
         logger.exception("Cookie update failed")
-        await update.message.reply_text(f"❌ Failed to update cookies: {str(e)[:200]}")
+        await status_msg.edit_text(f"❌ Failed to update cookies: {str(e)[:200]}")
     finally:
-        if 'tmp_path' in locals() and Path(tmp_path).exists():
+        if tmp_path and Path(tmp_path).exists():
             Path(tmp_path).unlink()
 
 # ---------- Bot Handlers ----------
@@ -317,7 +372,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     user = update.effective_user
     if user and ADMIN_IDS and user.id in ADMIN_IDS:
-        text += "\n\n🔧 *Admin command:* `/updatecookies` – upload a new `cookies.txt` file."
+        text += (
+            "\n\n🔧 *Admin commands:*\n"
+            "`/updatecookies` – upload a new `cookies.txt` file.\n"
+            "`/checkcookies` – check current cookies file status."
+        )
     await update.message.reply_text(text, parse_mode="Markdown")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -355,15 +414,13 @@ async def run_http_server():
 
 # ---------- Main entry point ----------
 async def main():
-    if not Path(COOKIES_FILE).exists():
-        logger.warning(f"Cookies file '{COOKIES_FILE}' not found. Authentication may fail.")
-
     # Build the application
     app = Application.builder().token(BOT_TOKEN).build()
 
     # Add handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("updatecookies", update_cookies))
+    app.add_handler(CommandHandler("checkcookies", check_cookies))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Initialize and start the bot
