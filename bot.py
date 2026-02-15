@@ -47,33 +47,42 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------- Helper functions (unchanged) ----------
+# ---------- Helper functions ----------
 def extract_url(text: str) -> str | None:
+    """Extract the first YouTube URL from a message."""
     pattern = r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/\S+'
     match = re.search(pattern, text)
     return match.group(0) if match else None
 
 def progress_hook(queue, loop):
+    """Return a hook function that puts progress into an asyncio.Queue."""
     def hook(d):
         if d['status'] == 'downloading':
             asyncio.run_coroutine_threadsafe(queue.put(d), loop)
     return hook
 
 async def progress_updater(queue, message):
+    """
+    Coroutine that reads progress from the queue and edits the Telegram message.
+    Updates every 2 seconds to avoid hitting rate limits.
+    """
     last_update = 0
     while True:
         try:
             progress = await asyncio.wait_for(queue.get(), timeout=2.0)
             if progress['status'] != 'downloading':
                 continue
+
             percent = progress.get('_percent_str', 'N/A').strip()
             speed = progress.get('_speed_str', 'N/A').strip()
             eta = progress.get('_eta_str', 'N/A').strip()
             text = f"⬇️ Downloading…\n{percent} at {speed}\nETA: {eta}"
+
             now = asyncio.get_event_loop().time()
             if now - last_update > 2.0:
                 await message.edit_text(text)
                 last_update = now
+
         except asyncio.TimeoutError:
             continue
         except asyncio.CancelledError:
@@ -83,9 +92,169 @@ async def progress_updater(queue, message):
             break
 
 async def download_and_upload(url: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (unchanged, same as before) ...
-    # (Omitted for brevity – copy from the original code)
-    # ...
+    """
+    Core logic:
+    - Extract video info
+    - Download with progress
+    - If video > 50MB, fall back to audio
+    - Upload to Telegram
+    """
+    chat_id = update.effective_chat.id
+    status_msg = await context.bot.send_message(chat_id, "🔍 Fetching video information...")
+
+    # Create a temporary directory for this download
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # ---------- Step 1: Get video info ----------
+        ydl_opts = YT_DLP_OPTIONS.copy()
+        ydl_opts.update({
+            "format": "best",           # Just to get info
+            "skip_download": True,
+        })
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = await asyncio.to_thread(ydl.extract_info, url, download=False)
+                if info is None:
+                    await status_msg.edit_text("❌ Could not retrieve video info.")
+                    return
+                title = info.get('title', 'Unknown')
+        except Exception as e:
+            logger.exception("Info extraction failed")
+            await status_msg.edit_text(f"❌ Failed to get video info: {str(e)[:200]}")
+            return
+
+        # ---------- Step 2: Decide format ----------
+        video_downloaded = False
+        audio_downloaded = False
+        file_path = None
+
+        # ----- Try video download -----
+        await status_msg.edit_text(f"🎬 Downloading video: {title}\nThis may take a while...")
+
+        queue = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        ydl_opts = YT_DLP_OPTIONS.copy()
+        ydl_opts.update({
+            "format": "best[ext=mp4]/best",   # Prefer mp4 for Telegram
+            "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
+            "progress_hooks": [progress_hook(queue, loop)],
+        })
+
+        progress_task = asyncio.create_task(progress_updater(queue, status_msg))
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                await asyncio.to_thread(ydl.download, [url])
+
+            files = list(Path(tmpdir).glob("*"))
+            if not files:
+                raise Exception("No file downloaded")
+            file_path = files[0]
+            file_size = file_path.stat().st_size
+
+            progress_task.cancel()
+            try:
+                await progress_task
+            except asyncio.CancelledError:
+                pass
+
+            if file_size <= MAX_FILE_SIZE:
+                video_downloaded = True
+                await status_msg.edit_text("✅ Download complete. Uploading video...")
+                with open(file_path, 'rb') as f:
+                    await context.bot.send_video(
+                        chat_id=chat_id,
+                        video=f,
+                        caption=title,
+                        read_timeout=60,
+                        write_timeout=60,
+                        connect_timeout=60,
+                        pool_timeout=60,
+                    )
+                await status_msg.delete()
+                return
+            else:
+                await status_msg.edit_text("📹 Video exceeds 50MB. Falling back to audio...")
+                file_path.unlink()
+                video_downloaded = False
+
+        except Exception as e:
+            logger.exception("Video download failed")
+            progress_task.cancel()
+            try:
+                await progress_task
+            except asyncio.CancelledError:
+                pass
+            if file_path and file_path.exists():
+                file_path.unlink()
+            await status_msg.edit_text("⚠️ Video download failed, retrying with audio...")
+
+        # ----- Fallback to audio -----
+        if not video_downloaded:
+            await status_msg.edit_text("🎵 Downloading audio...")
+            queue = asyncio.Queue()
+            progress_task = asyncio.create_task(progress_updater(queue, status_msg))
+
+            ydl_opts = YT_DLP_OPTIONS.copy()
+            ydl_opts.update({
+                "format": "bestaudio/best",
+                "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }],
+                "progress_hooks": [progress_hook(queue, loop)],
+            })
+
+            retries = 1
+            for attempt in range(retries + 1):
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        await asyncio.to_thread(ydl.download, [url])
+
+                    files = list(Path(tmpdir).glob("*.mp3"))
+                    if not files:
+                        files = list(Path(tmpdir).glob("*"))
+                    if not files:
+                        raise Exception("No audio file downloaded")
+                    file_path = files[0]
+
+                    progress_task.cancel()
+                    try:
+                        await progress_task
+                    except asyncio.CancelledError:
+                        pass
+
+                    await status_msg.edit_text("✅ Audio ready. Uploading...")
+                    with open(file_path, 'rb') as f:
+                        await context.bot.send_audio(
+                            chat_id=chat_id,
+                            audio=f,
+                            caption=title,
+                            title=title,
+                            performer="YouTube",
+                            read_timeout=60,
+                            write_timeout=60,
+                            connect_timeout=60,
+                            pool_timeout=60,
+                        )
+                    await status_msg.delete()
+                    return
+
+                except Exception as e:
+                    logger.exception(f"Audio download attempt {attempt+1} failed")
+                    if attempt < retries:
+                        await status_msg.edit_text(f"⚠️ Audio download failed, retrying... ({attempt+1}/{retries+1})")
+                        if file_path and file_path.exists():
+                            file_path.unlink()
+                    else:
+                        progress_task.cancel()
+                        try:
+                            await progress_task
+                        except asyncio.CancelledError:
+                            pass
+                        await status_msg.edit_text(f"❌ Download failed after retries: {str(e)[:200]}")
+                        return
 
 # ---------- New command: Update cookies ----------
 async def update_cookies(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -95,7 +264,6 @@ async def update_cookies(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ You are not authorized to use this command.")
         return
 
-    # Check if a document is attached
     if not update.message.document:
         await update.message.reply_text("Please attach a `cookies.txt` file.", parse_mode="Markdown")
         return
@@ -109,21 +277,17 @@ async def update_cookies(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ File too large (max 1 MB).")
         return
 
-    # Download the file
     file = await context.bot.get_file(doc.file_id)
     try:
-        # Use a temporary file to validate before overwriting
         with tempfile.NamedTemporaryFile(mode='wb', suffix='.txt', delete=False) as tmp:
             await file.download_to_drive(tmp.name)
             tmp_path = tmp.name
 
-        # Basic validation: check first line
         with open(tmp_path, 'r', encoding='utf-8') as f:
             first_line = f.readline().strip()
             if not first_line.startswith("# Netscape HTTP Cookie File"):
                 raise ValueError("Invalid cookies file format (first line must be '# Netscape HTTP Cookie File')")
 
-        # Replace the old cookies file
         dest = Path(COOKIES_FILE)
         dest.unlink(missing_ok=True)
         Path(tmp_path).rename(dest)
@@ -133,7 +297,6 @@ async def update_cookies(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Cookie update failed")
         await update.message.reply_text(f"❌ Failed to update cookies: {str(e)[:200]}")
     finally:
-        # Clean up temp file if it still exists
         if 'tmp_path' in locals() and Path(tmp_path).exists():
             Path(tmp_path).unlink()
 
